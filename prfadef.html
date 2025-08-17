@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Brachistochrone — Problem of Fastest Descent</title>
+<style>
+  :root { --bg:#0b0f14; --fg:#e7eef7; --muted:#94a3b8; --accent:#60a5fa; }
+  html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'; }
+  .wrap { display:grid; grid-template-columns: 320px 1fr; gap:16px; height:100%; padding:14px; box-sizing:border-box; }
+  .panel { background:#0f172a; border:1px solid #1e293b; border-radius:16px; padding:14px; box-shadow: 0 8px 20px rgba(0,0,0,.25); }
+  .panel h1 { font-size:18px; margin:0 0 8px; }
+  label { display:block; font-size:14px; color:var(--muted); margin:10px 0 6px; }
+  select, input[type="number"], input[type="range"] { width:100%; padding:8px; border-radius:10px; border:1px solid #334155; background:#0b1220; color:var(--fg); }
+  button { background:var(--accent); border:none; color:#07121f; padding:10px 12px; border-radius:12px; font-weight:600; cursor:pointer; }
+  button.secondary { background:#1f2937; color:var(--fg); }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .small { font-size:12px; color:var(--muted); }
+  canvas { width:100%; height:100%; background: radial-gradient(1200px 700px at 70% 20%, #0e1726, #0a0f17); border:1px solid #1e293b; border-radius:16px; }
+  .metrics { display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:8px; }
+  .metric { background:#0b1220; border:1px solid #162132; border-radius:12px; padding:8px; text-align:center; }
+  .metric .k { font-size:11px; color:#90a4c8; }
+  .metric .v { font-size:18px; font-weight:700; }
+  a.inline { color:#a5b4fc; text-decoration:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="panel">
+    <h1>Problem of Fastest Descent <span class="small">(choose a path, watch gravity do its thing)</span></h1>
+    <label>Path shape</label>
+    <select id="pathSelect">
+      <option value="straight">Straight line</option>
+      <option value="cycloid">Cycloid (Brachistochrone)</option>
+      <option value="quadratic">Quadratic curve</option>
+      <option value="sine">Sine curve</option>
+    </select>
+
+    <label>Gravity g (px/s²)</label>
+    <input id="gravity" type="range" min="200" max="5000" step="50" value="1500" />
+
+    <label>Ball radius (px)</label>
+    <input id="radius" type="range" min="4" max="20" step="1" value="8" />
+
+    <label>Discretization (segments)</label>
+    <input id="segments" type="range" min="200" max="4000" step="100" value="1200" />
+
+    <div class="row" style="margin-top:10px; gap:10px;">
+      <button id="startBtn">Start</button>
+      <button id="pauseBtn" class="secondary">Pause</button>
+      <button id="resetBtn" class="secondary">Reset</button>
+    </div>
+
+    <div class="metrics">
+      <div class="metric"><div class="k">Elapsed time</div><div class="v" id="elapsed">0.000 s</div></div>
+      <div class="metric"><div class="k">Final time (A→B)</div><div class="v" id="final">—</div></div>
+      <div class="metric"><div class="k">Arc length</div><div class="v" id="arc">—</div></div>
+      <div class="metric"><div class="k">Vertical drop</div><div class="v" id="drop">—</div></div>
+    </div>
+
+    <p class="small" style="margin-top:10px;">Drag the endpoints • A is <b style="color:#22c55e;">green</b>, B is <b style="color:#3b82f6;">blue</b>. The brachistochrone (cycloid) is recomputed each time to pass exactly through A and B. Time is computed from energy: <em>v(y) = √(2 g Δy)</em>, and integrated as <em>t = ∫ ds / v</em>. For a cycloid the analytic time is used: <em>T = θ₁ √(R/g)</em>. <b>Simulation by GPT-5</b>.</p>
+  </div>
+  <div class="panel" style="position:relative;">
+    <canvas id="cv"></canvas>
+  </div>
+</div>
+<script>
+(function(){
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  const DPR = Math.max(1, window.devicePixelRatio || 1);
+  function resize(){
+    const rect = cv.getBoundingClientRect();
+    cv.width = Math.floor(rect.width * DPR);
+    cv.height = Math.floor(rect.height * DPR);
+  }
+  window.addEventListener('resize', ()=>{resize(); draw();});
+  resize();
+
+  // UI
+  const selPath = document.getElementById('pathSelect');
+  const rngG = document.getElementById('gravity');
+  const rngR = document.getElementById('radius');
+  const rngN = document.getElementById('segments');
+  const startBtn = document.getElementById('startBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const resetBtn = document.getElementById('resetBtn');
+  const elElapsed = document.getElementById('elapsed');
+  const elFinal = document.getElementById('final');
+  const elArc = document.getElementById('arc');
+  const elDrop = document.getElementById('drop');
+
+  // World points (pixels). y downward.
+  let A = {x: 120, y: 120};
+  let B = {x: 780, y: 460};
+
+  // Draggable endpoints
+  let dragging = null;
+  cv.addEventListener('pointerdown', (e)=>{
+    const p = toCanvas(e);
+    if (dist(p, A) < 16) dragging = 'A';
+    else if (dist(p, B) < 16) dragging = 'B';
+  });
+  cv.addEventListener('pointermove', (e)=>{
+    if (!dragging) return;
+    const p = toCanvas(e);
+    if (dragging==='A') A = p; else B = p;
+    recompute();
+  });
+  window.addEventListener('pointerup', ()=> dragging=null);
+
+  function toCanvas(e){
+    const r = cv.getBoundingClientRect();
+    return { x:(e.clientX - r.left)*DPR, y:(e.clientY - r.top)*DPR };
+  }
+  function dist(p,q){ return Math.hypot(p.x-q.x, p.y-q.y); }
+
+  // Curve + physics tables
+  let curve = null; // function getPoint(t)->{x,y}, t in [0,1]
+  let poly = [];    // sampled points along curve
+  let sCum = [];    // cumulative arc length
+  let tCum = [];    // cumulative time from A
+  let totalLen = 0, totalTime = null;
+  let g = parseFloat(rngG.value);
+
+  // Animation state
+  let anim = { running:false, startTs:0, paused:false, pauseAccum:0, endReached:false };
+
+  selPath.addEventListener('change', recompute);
+  rngG.addEventListener('input', ()=>{ g = parseFloat(rngG.value); recompute(); });
+  rngR.addEventListener('input', draw);
+  rngN.addEventListener('input', recompute);
+
+  startBtn.addEventListener('click', ()=>{
+    if (!anim.running){
+      anim.running = true; anim.endReached=false; anim.pauseAccum = 0; anim.paused = false; anim.startTs = performance.now();
+      requestAnimationFrame(loop);
+    } else if (anim.paused){
+      anim.paused = false; anim.pauseAccum += performance.now() - anim.pauseStart;
+      requestAnimationFrame(loop);
+    }
+  });
+  pauseBtn.addEventListener('click', ()=>{
+    if (anim.running && !anim.paused){ anim.paused=true; anim.pauseStart = performance.now(); }
+  });
+  resetBtn.addEventListener('click', ()=>{ anim = {running:false, startTs:0, paused:false, pauseAccum:0, endReached:false}; draw(); updateElapsed(0); });
+
+  // --- Curve builders ---
+  function buildStraight(A,B){
+    return t=>({ x: A.x + (B.x-A.x)*t, y: A.y + (B.y-A.y)*t });
+  }
+  function buildQuadratic(A,B){
+    const midx = (A.x+B.x)/2, midy = (A.y+B.y)/2 + (B.y-A.y)*0.6; // sagging midpoint
+    return t=>{ const u=1-t; return {
+      x: u*u*A.x + 2*u*t*midx + t*t*B.x,
+      y: u*u*A.y + 2*u*t*midy + t*t*B.y
+    }; };
+  }
+  function buildSine(A,B){
+    const Lx = B.x - A.x; const Ly = B.y - A.y;
+    return t=>({ x: A.x + Lx*t, y: A.y + Ly*t + 0.25*Ly*Math.sin(Math.PI*t) });
+  }
+  // Solve cycloid params for given A->B drop/horizontal span.
+  function solveCycloid(A,B){
+    const dx = B.x - A.x; const dy = B.y - A.y; // dy > 0 required
+    if (dy <= 0 || dx <= 0) return null;
+    const f = (th)=> dx*(1-Math.cos(th)) - dy*(th - Math.sin(th));
+    const fp= (th)=> dx*Math.sin(th) - dy*(1 - Math.cos(th));
+    let th = Math.PI; // initial guess
+    for (let i=0;i<30;i++){
+      const y = f(th), y1 = fp(th);
+      const step = y1===0 ? 0 : y/y1;
+      th -= step;
+      if (!isFinite(th) || th<=1e-6) th = Math.PI/2 + i*0.05;
+      if (Math.abs(step) < 1e-9) break;
+    }
+    // clamp reasonable
+    if (!isFinite(th) || th<=1e-5) return null;
+    const R = dy / (1 - Math.cos(th));
+    return {R, th};
+  }
+  function buildCycloid(A,B){
+    const params = solveCycloid(A,B);
+    if (!params) return null;
+    const {R, th:TH} = params;
+    return t=>{ const th = TH*t; return {
+      x: A.x + R*(th - Math.sin(th)),
+      y: A.y + R*(1 - Math.cos(th))
+    }; };
+  }
+
+  // Sample curve, build arc & time tables
+  function sampleCurve(){
+    const N = parseInt(rngN.value);
+    poly = []; sCum=[0]; tCum=[0]; totalLen=0; totalTime=null;
+    let y0 = A.y; // reference height at start
+
+    for (let i=0;i<=N;i++){
+      const t = i/N; const p = curve(t); poly.push(p);
+      if (i>0){
+        const a = poly[i-1], b = poly[i];
+        const ds = Math.hypot(b.x-a.x, b.y-a.y);
+        totalLen += ds; sCum.push(totalLen);
+        // speed from potential drop; guard non-positive
+        const y = (a.y + b.y)/2; // midpoint height for this segment
+        const dy = Math.max(0, y - y0);
+        const v = Math.max(1e-6, Math.sqrt(2*g*dy));
+        const dt = ds / v;
+        tCum.push(tCum[tCum.length-1] + dt);
+      }
+    }
+    elArc.textContent = totalLen.toFixed(1) + ' px';
+    elDrop.textContent = Math.max(0, B.y - A.y).toFixed(1) + ' px';
+
+    // If cycloid, compute analytic time
+    if (selPath.value==='cycloid'){
+      const params = solveCycloid(A,B);
+      if (params){ totalTime = params.th * Math.sqrt(params.R / g); }
+    }
+    if (totalTime===null) totalTime = tCum[tCum.length-1];
+    elFinal.textContent = totalTime.toFixed(3) + ' s';
+  }
+
+  function recompute(){
+    // choose curve builder
+    const choice = selPath.value;
+    if (choice==='straight') curve = buildStraight(A,B);
+    else if (choice==='quadratic') curve = buildQuadratic(A,B);
+    else if (choice==='sine') curve = buildSine(A,B);
+    else if (choice==='cycloid') {
+      const c = buildCycloid(A,B);
+      curve = c || buildStraight(A,B); // fallback if invalid
+    }
+    sampleCurve(); draw();
+    // resetting animation state but keep elapsed display coherent
+    anim = { running:false, startTs:0, paused:false, pauseAccum:0, endReached:false };
+    updateElapsed(0);
+  }
+
+  function draw(){
+    ctx.clearRect(0,0,cv.width,cv.height);
+    ctx.save();
+    ctx.lineWidth = 2*DPR;
+
+    // draw curve
+    ctx.beginPath();
+    for (let i=0;i<poly.length;i++){
+      const p = poly[i];
+      if (i===0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = '#7dd3fc';
+    ctx.stroke();
+
+    // draw endpoints
+    const r = parseInt(rngR.value) * DPR;
+    ctx.fillStyle = '#22c55e'; // A green
+    ctx.beginPath(); ctx.arc(A.x, A.y, r*1.2, 0, 2*Math.PI); ctx.fill();
+    ctx.fillStyle = '#3b82f6'; // B blue
+    ctx.beginPath(); ctx.arc(B.x, B.y, r*1.2, 0, 2*Math.PI); ctx.fill();
+
+    // if animating, draw ball
+    if (anim.running){
+      const t = currentTime();
+      const pos = pointAtTime(t);
+      drawBall(pos.x, pos.y, r);
+      updateElapsed(t);
+      if (t >= totalTime && !anim.endReached){ anim.endReached = true; anim.running=false; }
+    } else if (!anim.paused){
+      // draw ball at start
+      drawBall(A.x, A.y, r);
+    }
+
+    ctx.restore();
+  }
+
+  function drawBall(x,y,r){
+    ctx.save();
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.ellipse(x+3*DPR, y+4*DPR, r*0.8, r*0.4, 0, 0, Math.PI*2); ctx.fill();
+    // ball
+    const grd = ctx.createRadialGradient(x-0.4*r, y-0.6*r, r*0.1, x, y, r);
+    grd.addColorStop(0, '#ffffff');
+    grd.addColorStop(1, '#f87171');
+    ctx.fillStyle = grd;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  function currentTime(){
+    if (!anim.running) return 0;
+    const now = performance.now();
+    const t = (now - anim.startTs - (anim.pauseAccum||0)) / 1000; // seconds
+    return Math.max(0, Math.min(totalTime, t));
+  }
+
+  function pointAtTime(t){
+    if (t<=0) return {x:A.x, y:A.y};
+    if (t>=totalTime) return {x:B.x, y:B.y};
+    // binary search in tCum (unless analytic cycloid)
+    if (selPath.value==='cycloid'){
+      const params = solveCycloid(A,B);
+      if (params){
+        const {R, th:TH} = params;
+        const theta = (t / (Math.sqrt(R/g))) ; // since T = TH * sqrt(R/g)
+        const th = Math.min(TH, Math.max(0, theta));
+        return { x: A.x + R*(th - Math.sin(th)), y: A.y + R*(1 - Math.cos(th)) };
+      }
+    }
+    // numeric fallback
+    let lo=0, hi=tCum.length-1;
+    while (lo+1<hi){
+      const mid = (lo+hi)>>1;
+      if (tCum[mid] <= t) lo = mid; else hi = mid;
+    }
+    const tt = (t - tCum[lo]) / (tCum[hi]-tCum[lo] || 1);
+    const p = poly[lo], q = poly[hi];
+    return { x: p.x + (q.x-p.x)*tt, y: p.y + (q.y-p.y)*tt };
+  }
+
+  function updateElapsed(t){ elElapsed.textContent = t.toFixed(3) + ' s'; }
+
+  function loop(){ if (!anim.running || anim.paused) { draw(); return; } draw(); requestAnimationFrame(loop); }
+
+  // initial compute
+  recompute();
+})();
+</script>
+</body>
+</html>
